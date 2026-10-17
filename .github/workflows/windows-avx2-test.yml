@@ -1,0 +1,270 @@
+name: Windows AVX2 test (Concat 0.2.7)
+
+# Source baseline: jub0t/Concat commit 14b5998d793d90858ac982926374044bba4bf39f.
+# Personal test build: requires AVX2, FMA, F16C and BMI2.
+# Retains upstream pinned downloads and normal Windows bundle smoke tests.
+# No release publishing, signing secrets, or pre-AVX2 compatibility checks.
+on:
+  push:
+    branches: ["test/0.2.7-avx2"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-avx2-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ORT_VERSION: 1.28.0
+  GGML_NATIVE: "OFF"
+  GGML_AVX2: "ON"
+  GGML_FMA: "ON"
+  GGML_F16C: "ON"
+  GGML_BMI2: "ON"
+
+jobs:
+  app:
+    name: Windows x64 AVX2 portable test
+    strategy:
+      matrix:
+        include:
+          - platform: windows
+            arch: x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            ffmpeg: win64
+            sherpa: win-x64
+            ort: win-x64
+            llvm: win64
+            vc: x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: The pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' src/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (v1), 2026-10-09
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+
+      - name: Read the version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' src/Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building Concat $version for ${{ matrix.target }}"
+
+
+      - name: FFmpeg development libraries and LLVM (Windows)
+        if: matrix.platform == 'windows'
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          & $bash scripts/ci/fetch.sh "llvm-${{ matrix.llvm }}" llvm.exe
+          if ($LASTEXITCODE -ne 0) { throw "the LLVM download failed" }
+          Start-Process -Wait -WindowStyle Hidden -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\llvm"
+          if (-not (Test-Path C:\llvm\bin\libclang.dll)) { throw "LLVM did not install to C:\llvm" }
+          Remove-Item llvm.exe -ErrorAction SilentlyContinue
+          if ("${{ matrix.arch }}" -eq "aarch64") {
+            "CC=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "CXX=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "CXXFLAGS=-EHsc" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+          "C:\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=C:\llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $bash scripts/ci/fetch.sh "ffmpeg-${{ matrix.ffmpeg }}" ffmpeg-win.zip
+          if ($LASTEXITCODE -ne 0) { throw "the FFmpeg download failed" }
+          Expand-Archive ffmpeg-win.zip -DestinationPath ffdl
+          $dir = (Get-ChildItem ffdl -Directory | Select-Object -First 1).FullName
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+
+      - name: ONNX Runtime (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh "onnxruntime-${{ matrix.ort }}" onnxruntime.zip
+          if ($LASTEXITCODE -ne 0) { throw "the ONNX Runtime download failed" }
+          Expand-Archive onnxruntime.zip -DestinationPath .
+          $dir = "$PWD\onnxruntime-${{ matrix.ort }}-$env:ORT_VERSION"
+          if (-not (Test-Path "$dir\lib\onnxruntime.lib")) { throw "$dir\lib\onnxruntime.lib is not there" }
+          if (-not (Test-Path "$dir\lib\onnxruntime.dll")) { throw "$dir\lib\onnxruntime.dll is not there" }
+          "ORT_LIB_LOCATION=$dir\lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\lib" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+
+      - name: sherpa-onnx shared libraries (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Select-String -Path src\Cargo.lock -Pattern 'name = "sherpa-onnx-sys"' -Context 0,1).Context.PostContext[0] -replace '.*"(.*)".*', '$1'
+          $name = "sherpa-onnx-${{ matrix.sherpa }}-shared-MT-Release-lib"
+          $stem = "sherpa-onnx-v$version-${{ matrix.sherpa }}-shared-MT-Release-lib"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          $url = & $bash scripts/ci/fetch.sh --url $name
+          if ($url -notmatch "/v$([regex]::Escape($version))/") { throw "scripts/ci/deps.lock pins $name for another version than Cargo.lock's $version" }
+          Write-Host "Downloading $stem"
+          & $bash scripts/ci/fetch.sh $name sherpa.tar.bz2
+          if ($LASTEXITCODE -ne 0) { throw "the sherpa-onnx download failed" }
+          Write-Host "Unpacking"
+          python -c "import tarfile; t = tarfile.open('sherpa.tar.bz2'); t.extractall(**({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))"
+          if (-not (Test-Path "$stem\lib")) { throw "$stem\lib is not there after unpacking" }
+          New-Item -ItemType Directory -Force sherpa-libs, sherpa-dlls | Out-Null
+          Copy-Item "$stem\lib\sherpa-onnx-*.lib" sherpa-libs\
+          Copy-Item "$stem\lib\sherpa-onnx-*.dll" sherpa-dlls\
+          "SHERPA_ONNX_LIB_DIR=$PWD\sherpa-libs" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHERPA_DLL_DIR=$PWD\sherpa-dlls" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src
+          key: avx2-0.2.7-${{ matrix.target }}
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST GGML ORT
+
+
+      - name: Build
+        timeout-minutes: 75
+        shell: bash
+        working-directory: src
+        run: |
+          set -o pipefail
+          cargo build --locked --profile app -p concat --target ${{ matrix.target }} 2>&1 | tee build.log
+
+
+      - name: Build log to the summary (failure only)
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f src/build.log ]; then
+            {
+              echo "### Build failed: ${{ matrix.target }}"
+              echo '```'
+              tail -n 150 src/build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+
+      - name: Stage (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "Concat-$env:VERSION-windows-${{ matrix.arch }}"
+          $dir = "stage\$name"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "src\target\${{ matrix.target }}\app\concat.exe" $dir
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dir
+          Copy-Item "$env:SHERPA_DLL_DIR\*.dll" $dir
+          Copy-Item "$env:ORT_DIR\lib\*.dll" $dir
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md $dir
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\${{ matrix.vc }}\Microsoft.VC14*.CRT" -Directory |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "no Visual C++ redistributable folder for ${{ matrix.vc }} under $vs" }
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find "VC\Tools\MSVC\**\bin\Host*\*\dumpbin.exe" | Select-Object -First 1
+          foreach ($pass in 1, 2) {
+            foreach ($pe in Get-ChildItem $dir -File -Include *.exe, *.dll -Recurse) {
+              foreach ($line in & $dumpbin /nologo /dependents $pe.FullName) {
+                $dll = $line.Trim()
+                if ($dll -match "\.dll$" -and (Test-Path "$($crt.FullName)\$dll") -and -not (Test-Path "$dir\$dll")) {
+                  Write-Host "$($pe.Name) imports $dll; copying it from $($crt.FullName)"
+                  Copy-Item "$($crt.FullName)\$dll" $dir
+                }
+              }
+            }
+          }
+          Get-ChildItem $dir | Format-Table Name, Length
+
+
+      - name: Smoke test (Windows)
+        if: matrix.platform == 'windows'
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/ci/smoke-windows.ps1 -Bundle "stage\Concat-$env:VERSION-windows-${{ matrix.arch }}"
+
+
+      - name: Verify Whisper build options
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $caches = @(Get-ChildItem "src/target/${{ matrix.target }}/app/build" -Recurse -Filter CMakeCache.txt | Where-Object { $_.FullName -match "whisper-rs-sys-" })
+          if ($caches.Count -eq 0) { throw "Whisper CMakeCache.txt not found; cannot verify this build." }
+          foreach ($cache in $caches) {
+            $lines = Get-Content -LiteralPath $cache.FullName
+            foreach ($flag in @("GGML_AVX2", "GGML_FMA", "GGML_F16C", "GGML_BMI2")) {
+              if (-not ($lines -match "^$flag\:[^=]+=ON$")) { throw "$flag is not ON in $($cache.FullName)" }
+            }
+            if (-not ($lines -match "^GGML_NATIVE:[^=]+=OFF$")) { throw "GGML_NATIVE must be OFF." }
+            Write-Host "Verified AVX2/FMA/F16C/BMI2 in $($cache.FullName)"
+          }
+
+      - name: Package isolated portable test
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = "stage/Concat-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Force "$bundle/portable/whisper-models" | Out-Null
+          @(
+            "Personal AVX2 test build; not an official Concat release."
+            "Requires AVX2, FMA, F16C and BMI2. Ryzen 5 2600 supports these."
+            "Application sources: upstream v0.2.7, 14b5998d793d90858ac982926374044bba4bf39f."
+            "Test build commit: $env:GITHUB_SHA"
+            "GGML_NATIVE=OFF; GGML_AVX2=ON; GGML_FMA=ON; GGML_F16C=ON; GGML_BMI2=ON"
+            "Copy the existing ggml-base.bin into portable/whisper-models before testing."
+            "Use a NEW test project and the same jfk.wav sample for timing."
+          ) | Set-Content -LiteralPath "$bundle/BUILD-INFO.txt" -Encoding utf8
+          "This directory isolates settings, logs, caches and models from the installed app." |
+            Set-Content -LiteralPath "$bundle/portable/README.txt" -Encoding utf8
+          "Place ggml-base.bin in this folder; model downloads are optional." |
+            Set-Content -LiteralPath "$bundle/portable/whisper-models/README.txt" -Encoding utf8
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $archive = "artifacts/Concat-$env:VERSION-windows-x86_64-AVX2-test.zip"
+          Compress-Archive -Path "$bundle/*" -DestinationPath $archive
+          $hash = Get-FileHash -LiteralPath $archive -Algorithm SHA256
+          "$($hash.Hash.ToLower())  $([IO.Path]::GetFileName($archive))" |
+            Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+
+      - name: Upload portable test
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Concat-0.2.7-Windows-x64-AVX2-test
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostics if build fails
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Windows-AVX2-build-diagnostics
+          path: src/build.log
+          if-no-files-found: ignore
+          retention-days: 7
