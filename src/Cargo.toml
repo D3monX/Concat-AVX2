@@ -135,3 +135,5 @@ incremental = false
 # bump it with Slint, re-applying the change.
 [patch.crates-io]
 i-slint-renderer-skia = { path = "patches/i-slint-renderer-skia" }
+# Backport whisper.cpp c33c5618: preserve phrase starts after silence.
+whisper-rs-sys = { path = "patches/whisper-rs-sys" }
