@@ -4,9 +4,9 @@ name: Windows AVX2 test (Concat 0.2.7)
 # Personal test build: requires AVX2, FMA, F16C and BMI2.
 # Retains upstream pinned downloads and normal Windows bundle smoke tests.
 # No release publishing, signing secrets, or pre-AVX2 compatibility checks.
+# Build only when explicitly requested in Actions > Run workflow.
+# Pushing source changes to the AVX2 branch must not start a build.
 on:
-  push:
-    branches: ["test/0.2.7-avx2"]
   workflow_dispatch:
 
 permissions:
