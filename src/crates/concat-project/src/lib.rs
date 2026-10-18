@@ -930,6 +930,27 @@ mod tests {
         assert_eq!(nan.max_height, 0.0);
     }
 
+    #[test]
+    fn word_reveal_is_opt_in_and_timing_round_trips() {
+        let old: TextStyle = serde_json::from_value(json!({"content":"one two"})).unwrap();
+        assert!(!old.word_reveal);
+        assert_eq!(old.word_onsets(2), vec![0.0, 0.8]);
+        let timed = TextStyle {
+            word_reveal: true, word_starts: vec![0.1, 0.45], ..old
+        };
+        let saved = serde_json::to_value(&timed).unwrap();
+        let read: TextStyle = serde_json::from_value(saved).unwrap();
+        assert_eq!(read, timed);
+        assert_eq!(read.word_onsets(2), vec![0.1, 0.45]);
+        assert_eq!(read.word_onsets(3), vec![0.0, 0.4, 0.8]);
+        assert_eq!(read.word_onsets(1), vec![0.0]);
+        assert!(read.word_onsets(0).is_empty());
+        let invalid = TextStyle {
+            word_starts: vec![0.3, -1.0, f64::NAN, 7.0], ..read
+        }.tidy();
+        assert_eq!(invalid.word_starts, vec![0.3, 0.3, 1.0]);
+    }
+
     /// A hand-edited clip time has a ceiling as well as a floor: `1e300`
     /// loaded as written, its frame number saturated, and the export
     /// panicked computing its time (audit 2026-10-09, finding 9).

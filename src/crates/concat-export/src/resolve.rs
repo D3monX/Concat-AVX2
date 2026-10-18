@@ -107,6 +107,7 @@ pub(crate) struct BuiltTimeline {
     /// carried beside `chains` rather than inside it, since it is baked
     /// once by the host and never resolved per frame the way effects are.
     pub(crate) reveal_maps: HashMap<ClipId, Arc<RevealMap>>,
+    pub(crate) title_reveals: HashMap<ClipId, Arc<TitleReveal>>,
     /// The clip whose cutout is drawn tinted rather than cut, if one is.
     pub(crate) highlight: Option<ClipId>,
     /// The layers: treatments over the stack, by span.
@@ -211,6 +212,7 @@ pub(crate) fn build_timeline(
     let mut ranges: HashMap<ClipId, concat_media::ColorRange> = HashMap::new();
     let mut chains: HashMap<ClipId, Vec<AppliedFilter>> = HashMap::new();
     let mut reveal_maps: HashMap<ClipId, Arc<RevealMap>> = HashMap::new();
+    let mut title_reveals = HashMap::new();
     let mut cutouts: HashMap<ClipId, CutoutJob> = HashMap::new();
     let mut highlight: Option<ClipId> = None;
 
@@ -294,6 +296,9 @@ pub(crate) fn build_timeline(
             if !effects.is_empty() {
                 chains.insert(id, effects);
             }
+            if let Some(reveal) = &clip.title_reveal {
+                title_reveals.insert(id, Arc::clone(reveal));
+            }
             if let Some(map) = &clip.reveal_map {
                 reveal_maps.insert(id, Arc::clone(map));
             }
@@ -318,6 +323,7 @@ pub(crate) fn build_timeline(
         ranges,
         chains,
         reveal_maps,
+        title_reveals,
         cutouts,
         highlight,
     }

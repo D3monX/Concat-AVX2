@@ -166,11 +166,17 @@ impl CaptionsPane {
                             .into_iter()
                             .filter_map(|segment| {
                                 let text = segment.text.trim().to_owned();
+                                let duration = ((segment.end - segment.start) / subject.speed).max(0.2);
+                                let word_starts = word_starts_from_segment(&segment, duration, subject.speed);
+                                if !text.is_empty() && word_starts.is_empty() {
+                                    log::warn!("caption at {:.2}s has no usable Whisper word timing; using regular cadence", segment.start);
+                                }
                                 (!text.is_empty()).then(|| {
                                     caption_clip(
                                         text,
                                         subject.start + segment.start / subject.speed,
-                                        ((segment.end - segment.start) / subject.speed).max(0.2),
+                                        duration,
+                                        word_starts,
                                         look,
                                         base.as_ref(),
                                     )
@@ -241,7 +247,7 @@ impl CaptionsPane {
         let commands: Vec<Command> = lines
             .into_iter()
             .map(|(text, seconds)| {
-                let command = caption_clip(text, at, seconds, look, base.as_ref());
+                let command = caption_clip(text, at, seconds, Vec::new(), look, base.as_ref());
                 at += seconds;
                 command
             })
@@ -378,12 +384,37 @@ fn source_label(name: &str, start: f64) -> String {
     }
 }
 
+/// Use the first text-bearing token of each renderer word. Multiple tokens
+/// may spell one word, or one token may contain several words (same onset).
+/// Neither case needs invented interpolation. Reject incomplete/nonmonotonic
+/// estimates as a whole, allowing the regular cadence the user requested.
+fn word_starts_from_segment(segment: &Segment, duration: f64, speed: f64) -> Vec<f64> {
+    if !duration.is_finite() || duration <= 0.0 || !speed.is_finite() || speed <= 0.0
+        || !segment.start.is_finite() || !segment.end.is_finite() || segment.end <= segment.start
+    { return Vec::new(); }
+    let mut starts = Vec::new();
+    for word in concat_text::word_ranges(&segment.text) {
+        let Some(token) = segment.tokens.iter().find(|token| {
+            token.byte_start <= word.start && word.start < token.byte_end
+        }) else { return Vec::new(); };
+        if token.byte_end > segment.text.len() || !token.start.is_finite() || !token.end.is_finite()
+            || token.end < token.start || token.start < segment.start - 1e-6
+            || token.start >= segment.end
+        { return Vec::new(); }
+        let at = ((token.start - segment.start) / speed / duration).clamp(0.0, 1.0);
+        if starts.last().is_some_and(|previous| *previous > at) { return Vec::new(); }
+        starts.push(at);
+    }
+    starts
+}
+
 /// One caption as a title clip: its words, when and for how long, and
 /// its look.
 fn caption_clip(
     text: String,
     start: f64,
     duration: f64,
+    word_starts: Vec<f64>,
     look: (f64, f64),
     base: Option<&TextStyle>,
 ) -> Command {
@@ -393,6 +424,7 @@ fn caption_clip(
     // bundled face otherwise.
     let style = match base {
         Some(base) => TextStyle {
+            word_starts,
             content: text,
             font_size,
             max_width: 0.0,
@@ -400,6 +432,7 @@ fn caption_clip(
             ..base.clone()
         },
         None => TextStyle {
+            word_starts,
             content: text,
             font_family: "Hanken Grotesk".to_owned(),
             font_size,
@@ -508,7 +541,73 @@ fn wrap_caption(sentence: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{script_captions, source_label};
+    use super::{caption_clip, script_captions, source_label, word_starts_from_segment};
+    use concat_project::{Command, model::TextStyle};
+    use concat_speech::transcribe::{Segment, TokenTiming};
+
+    fn timed_caption() -> Segment {
+        let pieces = ["C", "'", "era", " cos", "ì", "."];
+        let times = [1.1, 1.12, 1.2, 1.9, 2.0, 2.2];
+        let mut cursor = 0;
+        let tokens = pieces.iter().zip(times).map(|(text, start)| {
+            let token = TokenTiming {
+                byte_start: cursor, byte_end: cursor + text.len(), start, end: start + 0.05,
+            };
+            cursor += text.len();
+            token
+        }).collect();
+        Segment { start: 1.0, end: 3.0, text: pieces.concat(), tokens }
+    }
+
+    #[test]
+    fn whisper_subwords_become_word_onsets_not_regular_steps() {
+        let segment = timed_caption();
+        let starts = word_starts_from_segment(&segment, 2.0, 1.0);
+        assert_eq!(starts.len(), 2, "apostrophe and accents stay in their word");
+        assert!((starts[0] - 0.05).abs() < 1e-9);
+        assert!((starts[1] - 0.45).abs() < 1e-9);
+        assert_eq!(word_starts_from_segment(&segment, 1.0, 2.0), starts);
+        // A minimum caption duration must not stretch acoustic onsets.
+        let stretched = word_starts_from_segment(&segment, 4.0, 1.0);
+        assert!((stretched[1] - starts[1] / 2.0).abs() < 1e-9);
+        let look = (0.35, 0.05);
+        let base = TextStyle { word_reveal: true, ..Default::default() };
+        let command = caption_clip(segment.text, 10.0, 2.0, starts.clone(), look, Some(&base));
+        match command {
+            Command::AddTextClip { style: Some(style), start, duration: Some(duration), .. } => {
+                assert_eq!(start, 10.0);
+                assert_eq!(duration, 2.0);
+                assert_eq!(style.word_starts, starts);
+                assert!(style.word_reveal);
+            }
+            _ => panic!("one caption containing its word timing, no batch or extra clips"),
+        }
+    }
+
+    #[test]
+    fn bad_or_missing_word_timing_uses_the_regular_fallback() {
+        let mut segment = timed_caption();
+        segment.tokens.clear();
+        assert!(word_starts_from_segment(&segment, 2.0, 1.0).is_empty());
+        let fallback = TextStyle::default().word_onsets(2);
+        assert_eq!(fallback, vec![0.0, 0.8]);
+        let mut segment = timed_caption();
+        segment.tokens[0].start = -1.0;
+        assert!(word_starts_from_segment(&segment, 2.0, 1.0).is_empty());
+        let mut segment = timed_caption();
+        segment.tokens[3].start = 1.01;
+        assert!(word_starts_from_segment(&segment, 2.0, 1.0).is_empty());
+        assert!(word_starts_from_segment(&segment, 2.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn two_words_in_one_token_keep_its_measured_onset() {
+        let segment = Segment {
+            start: 4.0, end: 8.0, text: "one two".into(),
+            tokens: vec![TokenTiming { byte_start: 0, byte_end: 7, start: 5.0, end: 7.0 }],
+        };
+        assert_eq!(word_starts_from_segment(&segment, 4.0, 1.0), vec![0.25, 0.25]);
+    }
 
     /// A clip in the voice list is its file and where it starts, in
     /// minutes and seconds, with hours once there are any.
